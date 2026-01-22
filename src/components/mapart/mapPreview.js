@@ -15,6 +15,24 @@ import IMG_GridOverlay from "../../images/gridOverlay.png";
 
 import "./mapPreview.css";
 
+function scaledCanvasToDataUrl(canvas, maxDimension = 512) {
+  if (!canvas) return null;
+  const w = canvas.width;
+  const h = canvas.height;
+  const scale = Math.min(1, maxDimension / Math.max(w, h));
+  if (scale === 1) {
+    return canvas.toDataURL("image/png");
+  }
+  const out = document.createElement("canvas");
+  out.width = Math.max(1, Math.round(w * scale));
+  out.height = Math.max(1, Math.round(h * scale));
+  const ctx = out.getContext("2d");
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(canvas, 0, 0, out.width, out.height);
+  return out.toDataURL("image/png");
+}
+
 class MapPreview extends Component {
   state = {
     mapPreviewSizeScale: 2,
@@ -40,6 +58,7 @@ class MapPreview extends Component {
       prevProps.optionValue_cropImage_zoom === newProps.optionValue_cropImage_zoom,
       prevProps.optionValue_cropImage_percent_x === newProps.optionValue_cropImage_percent_x,
       prevProps.optionValue_cropImage_percent_y === newProps.optionValue_cropImage_percent_y,
+      prevProps.optionValue_scaleFactor === newProps.optionValue_scaleFactor,
       prevProps.optionValue_staircasing === newProps.optionValue_staircasing,
       prevProps.optionValue_preprocessingEnabled === newProps.optionValue_preprocessingEnabled,
       prevProps.preProcessingValue_brightness === newProps.preProcessingValue_brightness,
@@ -47,6 +66,8 @@ class MapPreview extends Component {
       prevProps.preProcessingValue_saturation === newProps.preProcessingValue_saturation,
       prevProps.preProcessingValue_backgroundColourSelect === newProps.preProcessingValue_backgroundColourSelect,
       prevProps.preProcessingValue_backgroundColour === newProps.preProcessingValue_backgroundColour,
+      prevProps.preProcessingValue_blur === newProps.preProcessingValue_blur,
+      prevProps.preProcessingValue_sharpen === newProps.preProcessingValue_sharpen,
       prevProps.uploadedImage === newProps.uploadedImage,
     ];
     return (
@@ -70,6 +91,7 @@ class MapPreview extends Component {
       prevProps.optionValue_cropImage_zoom === newProps.optionValue_cropImage_zoom,
       prevProps.optionValue_cropImage_percent_x === newProps.optionValue_cropImage_percent_x,
       prevProps.optionValue_cropImage_percent_y === newProps.optionValue_cropImage_percent_y,
+      prevProps.optionValue_scaleFactor === newProps.optionValue_scaleFactor,
       prevProps.optionValue_staircasing === newProps.optionValue_staircasing,
       prevProps.optionValue_whereSupportBlocks === newProps.optionValue_whereSupportBlocks,
       prevProps.optionValue_transparency === newProps.optionValue_transparency,
@@ -82,6 +104,8 @@ class MapPreview extends Component {
       prevProps.preProcessingValue_saturation === newProps.preProcessingValue_saturation,
       prevProps.preProcessingValue_backgroundColourSelect === newProps.preProcessingValue_backgroundColourSelect,
       prevProps.preProcessingValue_backgroundColour === newProps.preProcessingValue_backgroundColour,
+      prevProps.preProcessingValue_blur === newProps.preProcessingValue_blur,
+      prevProps.preProcessingValue_sharpen === newProps.preProcessingValue_sharpen,
       prevProps.uploadedImage === newProps.uploadedImage,
     ];
     return (
@@ -173,9 +197,10 @@ class MapPreview extends Component {
       preProcessingValue_saturation,
       preProcessingValue_backgroundColourSelect,
       preProcessingValue_backgroundColour,
+      preProcessingValue_blur,
+      preProcessingValue_sharpen,
       uploadedImage,
-    } = this.props;
-    const {
+      optionValue_scaleFactor,
       optionValue_mapSize_x,
       optionValue_mapSize_y,
       optionValue_cropImage,
@@ -207,35 +232,40 @@ class MapPreview extends Component {
         ctx_source.fillStyle = backgroundColour;
         ctx_source.fill();
       }
-      ctx_source.filter = `brightness(${preProcessingValue_brightness}%) contrast(${preProcessingValue_contrast}%) saturate(${preProcessingValue_saturation}%)`;
+      ctx_source.filter = `blur(${preProcessingValue_blur || 0}px) brightness(${preProcessingValue_brightness}%) contrast(${preProcessingValue_contrast}%) saturate(${preProcessingValue_saturation}%)`;
     } else {
       ctx_source.filter = "none";
     }
 
     switch (optionValue_cropImage) {
       case CropModes.OFF.uniqueId: {
-        ctx_source.drawImage(uploadedImage, 0, 0, ctx_source.canvas.width, ctx_source.canvas.height);
+        const dw = ctx_source.canvas.width * (optionValue_scaleFactor || 1);
+        const dh = ctx_source.canvas.height * (optionValue_scaleFactor || 1);
+        const dx = (ctx_source.canvas.width - dw) / 2;
+        const dy = (ctx_source.canvas.height - dh) / 2;
+        ctx_source.drawImage(uploadedImage, dx, dy, dw, dh);
         break;
       }
       case CropModes.CENTER.uniqueId:
       case CropModes.MANUAL.uniqueId: {
         const img_width = uploadedImage.width;
         const img_height = uploadedImage.height;
+        const effectiveZoom = Math.max(1, optionValue_cropImage_zoom * (optionValue_scaleFactor || 1));
         let samplingWidth;
         let samplingHeight;
         let samplingOffset_x;
         let samplingOffset_y;
         if (img_width * optionValue_mapSize_y > img_height * optionValue_mapSize_x) {
           // image w/h greater than canvas w/h
-          samplingWidth = Math.floor((10 * img_height * optionValue_mapSize_x) / (optionValue_mapSize_y * optionValue_cropImage_zoom));
+          samplingWidth = Math.floor((10 * img_height * optionValue_mapSize_x) / (optionValue_mapSize_y * effectiveZoom));
           // the 10 is because the input is from 10 to 50 in steps of 1; scale down by 10
-          samplingHeight = Math.floor((10 * img_height) / optionValue_cropImage_zoom);
+          samplingHeight = Math.floor((10 * img_height) / effectiveZoom);
           samplingOffset_x = Math.floor((optionValue_cropImage_percent_x * (img_width - samplingWidth)) / 100);
           samplingOffset_y = Math.floor((optionValue_cropImage_percent_y * (img_height - samplingHeight)) / 100);
         } else {
           // image w/h leq canvas w/h
-          samplingWidth = Math.floor((10 * img_width) / optionValue_cropImage_zoom);
-          samplingHeight = Math.floor((10 * img_width * optionValue_mapSize_y) / (optionValue_mapSize_x * optionValue_cropImage_zoom));
+          samplingWidth = Math.floor((10 * img_width) / effectiveZoom);
+          samplingHeight = Math.floor((10 * img_width * optionValue_mapSize_y) / (optionValue_mapSize_x * effectiveZoom));
           samplingOffset_x = Math.floor((optionValue_cropImage_percent_x * (img_width - samplingWidth)) / 100);
           samplingOffset_y = Math.floor((optionValue_cropImage_percent_y * (img_height - samplingHeight)) / 100);
         }
@@ -255,6 +285,35 @@ class MapPreview extends Component {
       default: {
         throw new Error("Unknown optionValue_cropImage");
       }
+    }
+
+    if (optionValue_preprocessingEnabled && preProcessingValue_sharpen > 0) {
+      const w = ctx_source.canvas.width;
+      const h = ctx_source.canvas.height;
+      const imageData = ctx_source.getImageData(0, 0, w, h);
+      const data = imageData.data;
+      const src = new Uint8ClampedArray(data);
+      const strength = Math.max(0, Math.min(1, preProcessingValue_sharpen / 100));
+      const clamp255 = (n) => Math.max(0, Math.min(255, n));
+
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const i = (y * w + x) * 4;
+          const iUp = ((y - 1) * w + x) * 4;
+          const iDown = ((y + 1) * w + x) * 4;
+          const iLeft = (y * w + (x - 1)) * 4;
+          const iRight = (y * w + (x + 1)) * 4;
+
+          for (let c = 0; c < 3; c++) {
+            const center = src[i + c];
+            const conv = 5 * center - src[iUp + c] - src[iDown + c] - src[iLeft + c] - src[iRight + c];
+            data[i + c] = clamp255(center * (1 - strength) + conv * strength);
+          }
+          data[i + 3] = src[i + 3];
+        }
+      }
+
+      ctx_source.putImageData(imageData, 0, 0);
     }
   }
 
@@ -292,6 +351,11 @@ class MapPreview extends Component {
           maps: e.data.body.maps,
           currentSelectedBlocks: e.data.body.currentSelectedBlocks,
         });
+
+        if (this.props.onPreviewDataUrl) {
+          const url = scaledCanvasToDataUrl(canvasRef_display.current);
+          this.props.onPreviewDataUrl(url);
+        }
       } else if (e.data.head === "PROGRESS_REPORT") {
         this.setState({ workerProgress: e.data.body });
       }
