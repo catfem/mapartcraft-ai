@@ -12,6 +12,30 @@ MapartCraft is a static website written in ReactJS; running and building require
 2. Build using `npm run build`, or run a debug version with `npm run start`.
 3. Alternatively use the shell script `build.sh` for deployment on Linux. This will also copy a `.htaccess` file to the build folder for use with Apache.
 
+# Deployment
+
+## Cloudflare Pages
+
+To deploy this project to Cloudflare Pages:
+
+1.  **Build command:** `npm run build`
+2.  **Build output directory:** `build`
+3.  **Compatibility:** The project uses `react-scripts 4`, which requires the legacy OpenSSL provider on Node.js 17+. This is automatically handled by the `build` script and `.npmrc` file.
+
+# Troubleshooting
+
+## Node.js OpenSSL Issue
+
+If you encounter the error `ERR_OSSL_EVP_UNSUPPORTED` during build, it is because you are using a Node.js version (17+) that defaults to a newer OpenSSL version incompatible with the older Webpack version used in `react-scripts 4`.
+
+The fix included in this project uses `NODE_OPTIONS=--openssl-legacy-provider`. If you are running scripts other than `npm run build` and encounter this issue, you can set the environment variable manually:
+
+```bash
+export NODE_OPTIONS=--openssl-legacy-provider
+```
+
+Or use a compatible Node.js version as specified in `.node-version`.
+
 The default build settings assume the app is being hosted at https://YOUR-SITE-HERE.com/mapartcraft. To change the folder from which the site is hosted modify the following:
 
 - `homepage` in `package.json`
