@@ -6,6 +6,13 @@ import GreenButtons from "./greenButtons";
 import MapPreview from "./mapPreview";
 import MapSettings from "./mapSettings";
 import Materials from "./materials";
+
+import PreEditPanel from "../PreEditPanel";
+import RefinementPanel from "../RefinementPanel";
+
+import { analyzeOriginalImage, analyzeSchematicPreview } from "../../lib/ai/analysisEngine";
+import { suggestParameters } from "../../lib/ai/parameterSuggester";
+import { hasGeminiApiKey } from "../../lib/ai/geminiClient";
 import coloursJSON from "./json/coloursJSON.json";
 import ViewOnline2D from "./viewOnline2D/viewOnline2D";
 import ViewOnline3D from "./viewOnline3D/viewOnline3D";
@@ -22,6 +29,38 @@ import IMG_Upload from "../../images/upload.png";
 
 import "./mapartController.css";
 
+function imageElementToDataUrl(img, maxDimension = 512) {
+  try {
+    const w = img.width;
+    const h = img.height;
+    const scale = Math.min(1, maxDimension / Math.max(w, h));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(w * scale));
+    canvas.height = Math.max(1, Math.round(h * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/png");
+  } catch (e) {
+    return null;
+  }
+}
+
+function ditherMethodStringToUniqueId(method, DitherMethods) {
+  switch (method) {
+    case "none":
+      return DitherMethods.None.uniqueId;
+    case "ordered":
+      return DitherMethods.Ordered33?.uniqueId ?? DitherMethods.None.uniqueId;
+    case "bayer":
+      return DitherMethods.Bayer44?.uniqueId ?? DitherMethods.Bayer22?.uniqueId ?? DitherMethods.None.uniqueId;
+    case "floyd-steinberg":
+    default:
+      return DitherMethods.FloydSteinberg.uniqueId;
+  }
+}
+
 class MapartController extends Component {
   state = {
     coloursJSON: null,
@@ -34,6 +73,7 @@ class MapartController extends Component {
     optionValue_cropImage_zoom: 10, // this gets scaled down by a factor of 10
     optionValue_cropImage_percent_x: 50,
     optionValue_cropImage_percent_y: 50,
+    optionValue_scaleFactor: 1,
     optionValue_showGridOverlay: false,
     optionValue_staircasing: MapModes.SCHEMATIC_NBT.staircaseModes.VALLEY.uniqueId,
     optionValue_whereSupportBlocks: WhereSupportBlocksModes.ALL_OPTIMIZED.uniqueId,
@@ -50,6 +90,8 @@ class MapartController extends Component {
     preProcessingValue_saturation: 100,
     preProcessingValue_backgroundColourSelect: BackgroundColourModes.OFF.uniqueId,
     preProcessingValue_backgroundColour: "#151515",
+    preProcessingValue_blur: 0,
+    preProcessingValue_sharpen: 0,
     optionValue_extras_moreStaircasingOptions: false,
     uploadedImage: null,
     uploadedImage_baseFilename: null,
@@ -63,10 +105,41 @@ class MapartController extends Component {
     mapPreviewWorker_inProgress: false,
     viewOnline_NBT: null,
     viewOnline_3D: false,
+
+    aiEnabled: true,
+    aiStatus: "idle",
+    aiError: null,
+    aiOriginalImageDataUrl: null,
+    aiPreviewDataUrl_current: null,
+    aiPreviewDataUrl_before: null,
+    aiPreviewDataUrl_after: null,
+    aiOriginalAnalysis: null,
+    aiPreviewAnalysis: null,
+    aiSuggestions: null,
+    aiPreEditActive: true,
+    aiBaselineSettings: null,
+    aiInitialSettings: null,
+    aiAnalysisRunId: 0,
+
+    aiRefinementOpen: false,
+    aiRefinementLoading: false,
+    aiRefinementError: null,
+    aiRefinementFeedback: null,
+    aiRefinementSuggestions: null,
+    aiRefinementRound: 0,
+    aiMaxRefinementRounds: 5,
   };
 
   constructor(props) {
     super(props);
+
+    if (!hasGeminiApiKey()) {
+      this.state.aiEnabled = false;
+      this.state.aiStatus = "disabled";
+      this.state.aiError = "Missing Gemini API key. Set REACT_APP_GEMINI_API_KEY (CRA) or VITE_GEMINI_API_KEY.";
+      this.state.aiPreEditActive = false;
+    }
+
     // update default presets to latest version; done via checking for localeString
     CookieManager.init();
     let cookiesPresets_loaded = JSON.parse(CookieManager.touchCookie("mapartcraft_presets", JSON.stringify(DefaultPresets)));
@@ -158,6 +231,400 @@ class MapartController extends Component {
     document.removeEventListener("paste", this.eventListener_paste);
   }
 
+  componentDidUpdate(_prevProps, prevState) {
+    if (this.state.uploadedImage !== prevState.uploadedImage) {
+      this.onNewImageForAI();
+    }
+  }
+
+  getAIParamsSnapshot = () => {
+    const {
+      optionValue_dithering,
+      optionValue_scaleFactor,
+      optionValue_preprocessingEnabled,
+      preProcessingValue_blur,
+      preProcessingValue_sharpen,
+      preProcessingValue_brightness,
+      preProcessingValue_contrast,
+      preProcessingValue_saturation,
+      optionValue_transparency,
+      optionValue_transparencyTolerance,
+      optionValue_whereSupportBlocks,
+      optionValue_supportBlock,
+    } = this.state;
+
+    return {
+      dithering: optionValue_dithering,
+      scaleFactor: optionValue_scaleFactor,
+      preprocessingEnabled: optionValue_preprocessingEnabled,
+      blurPx: preProcessingValue_blur,
+      sharpen: preProcessingValue_sharpen,
+      brightness: preProcessingValue_brightness,
+      contrast: preProcessingValue_contrast,
+      saturation: preProcessingValue_saturation,
+      transparencyEnabled: optionValue_transparency,
+      transparencyTolerance: optionValue_transparencyTolerance,
+      whereSupportBlocks: optionValue_whereSupportBlocks,
+      supportBlock: optionValue_supportBlock,
+    };
+  };
+
+  restoreFromSnapshot = (snapshot) => {
+    if (!snapshot) return;
+    this.setState({
+      optionValue_dithering: snapshot.dithering,
+      optionValue_scaleFactor: snapshot.scaleFactor,
+      optionValue_preprocessingEnabled: snapshot.preprocessingEnabled,
+      preProcessingValue_blur: snapshot.blurPx,
+      preProcessingValue_sharpen: snapshot.sharpen,
+      preProcessingValue_brightness: snapshot.brightness,
+      preProcessingValue_contrast: snapshot.contrast,
+      preProcessingValue_saturation: snapshot.saturation,
+      optionValue_transparency: snapshot.transparencyEnabled,
+      optionValue_transparencyTolerance: snapshot.transparencyTolerance,
+      optionValue_whereSupportBlocks: snapshot.whereSupportBlocks,
+      optionValue_supportBlock: snapshot.supportBlock,
+    });
+  };
+
+  applyAISuggestionsToSettings = (suggestions) => {
+    if (!suggestions) return;
+
+    const patch = {
+      optionValue_dithering: ditherMethodStringToUniqueId(suggestions.dithering.method, DitherMethods),
+      optionValue_scaleFactor: suggestions.scaleFactor.value,
+      optionValue_preprocessingEnabled: suggestions.preprocessing.enabled,
+      preProcessingValue_blur: suggestions.preprocessing.blurPx,
+      preProcessingValue_sharpen: suggestions.preprocessing.sharpen,
+      preProcessingValue_brightness: suggestions.preprocessing.brightness,
+      preProcessingValue_contrast: suggestions.preprocessing.contrast,
+      preProcessingValue_saturation: suggestions.preprocessing.saturation,
+      optionValue_transparency: suggestions.transparency.enabled,
+      optionValue_transparencyTolerance: suggestions.transparency.tolerance,
+      optionValue_supportBlock: suggestions.supportBlocks.supportBlock,
+      optionValue_whereSupportBlocks: {
+        none: WhereSupportBlocksModes.NONE.uniqueId,
+        important: WhereSupportBlocksModes.IMPORTANT.uniqueId,
+        all_optimized: WhereSupportBlocksModes.ALL_OPTIMIZED.uniqueId,
+        all_double_optimized: WhereSupportBlocksModes.ALL_DOUBLE_OPTIMIZED.uniqueId,
+      }[suggestions.supportBlocks.where] ?? WhereSupportBlocksModes.ALL_OPTIMIZED.uniqueId,
+    };
+
+    this.setState(patch);
+  };
+
+  onNewImageForAI = () => {
+    const { uploadedImage, aiEnabled } = this.state;
+    if (!uploadedImage) return;
+
+    const originalDataUrl = imageElementToDataUrl(uploadedImage, 512);
+    const initialSettings = this.getAIParamsSnapshot();
+
+    if (aiEnabled && !originalDataUrl) {
+      this.setState((currentState) => {
+        return {
+          aiStatus: "error",
+          aiError: "Unable to read the uploaded image for AI analysis (canvas may be tainted).",
+          aiOriginalImageDataUrl: null,
+          aiPreviewDataUrl_current: null,
+          aiPreviewDataUrl_before: null,
+          aiPreviewDataUrl_after: null,
+          aiOriginalAnalysis: null,
+          aiPreviewAnalysis: null,
+          aiSuggestions: null,
+          aiPreEditActive: true,
+          aiBaselineSettings: initialSettings,
+          aiInitialSettings: initialSettings,
+          aiAnalysisRunId: currentState.aiAnalysisRunId + 1,
+          aiRefinementOpen: false,
+          aiRefinementLoading: false,
+          aiRefinementError: null,
+          aiRefinementFeedback: null,
+          aiRefinementSuggestions: null,
+          aiRefinementRound: 0,
+        };
+      });
+      return;
+    }
+
+    this.setState((currentState) => {
+      return {
+        aiStatus: aiEnabled ? "waiting-preview" : "disabled",
+        aiError: aiEnabled ? null : currentState.aiError,
+        aiOriginalImageDataUrl: originalDataUrl,
+        aiPreviewDataUrl_current: null,
+        aiPreviewDataUrl_before: null,
+        aiPreviewDataUrl_after: null,
+        aiOriginalAnalysis: null,
+        aiPreviewAnalysis: null,
+        aiSuggestions: null,
+        aiPreEditActive: aiEnabled,
+        aiBaselineSettings: initialSettings,
+        aiInitialSettings: initialSettings,
+        aiAnalysisRunId: currentState.aiAnalysisRunId + 1,
+        aiRefinementOpen: false,
+        aiRefinementLoading: false,
+        aiRefinementError: null,
+        aiRefinementFeedback: null,
+        aiRefinementSuggestions: null,
+        aiRefinementRound: 0,
+      };
+    });
+  };
+
+  handlePreviewDataUrl = (previewDataUrl) => {
+    if (!previewDataUrl) return;
+
+    this.setState(
+      (currentState) => {
+        const updates = {
+          aiPreviewDataUrl_current: previewDataUrl,
+        };
+
+        if (currentState.aiEnabled && currentState.aiStatus === "waiting-preview" && !currentState.aiPreviewDataUrl_before) {
+          updates.aiPreviewDataUrl_before = previewDataUrl;
+        }
+
+        if (currentState.aiEnabled && currentState.aiPreEditActive && currentState.aiSuggestions) {
+          updates.aiPreviewDataUrl_after = previewDataUrl;
+        }
+
+        return updates;
+      },
+      () => {
+        if (this.state.aiEnabled && this.state.aiStatus === "waiting-preview" && this.state.aiOriginalImageDataUrl && this.state.aiPreviewDataUrl_before) {
+          this.runAIInitialAnalysis();
+        }
+      }
+    );
+  };
+
+  runAIInitialAnalysis = async () => {
+    const {
+      aiEnabled,
+      aiStatus,
+      aiOriginalImageDataUrl,
+      aiPreviewDataUrl_before,
+      optionValue_modeNBTOrMapdat,
+      aiAnalysisRunId,
+    } = this.state;
+
+    if (!aiEnabled || aiStatus !== "waiting-preview") return;
+    if (!aiOriginalImageDataUrl || !aiPreviewDataUrl_before) return;
+
+    const runId = aiAnalysisRunId;
+
+    this.setState({ aiStatus: "analyzing", aiError: null, aiPreEditActive: true });
+
+    try {
+      const originalAnalysis = await analyzeOriginalImage({ imageDataUrl: aiOriginalImageDataUrl });
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      const previewAnalysis = await analyzeSchematicPreview({
+        originalImageDataUrl: aiOriginalImageDataUrl,
+        previewImageDataUrl: aiPreviewDataUrl_before,
+      });
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      const mode = optionValue_modeNBTOrMapdat === MapModes.SCHEMATIC_NBT.uniqueId ? "nbt" : "mapdat";
+      const suggestions = await suggestParameters({
+        originalAnalysis,
+        previewAnalysis,
+        currentParams: this.getAIParamsSnapshot(),
+        mode,
+        iteration: 0,
+      });
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      this.setState(
+        {
+          aiStatus: "ready",
+          aiError: null,
+          aiOriginalAnalysis: originalAnalysis,
+          aiPreviewAnalysis: previewAnalysis,
+          aiSuggestions: suggestions,
+          aiPreviewDataUrl_after: null,
+        },
+        () => {
+          this.applyAISuggestionsToSettings(suggestions);
+        }
+      );
+    } catch (e) {
+      if (this.state.aiAnalysisRunId !== runId) return;
+      this.setState({
+        aiStatus: "error",
+        aiError: e?.message || String(e),
+        aiPreEditActive: true,
+      });
+    }
+  };
+
+  onToggleAIEnabled = () => {
+    this.setState(
+      (currentState) => {
+        const nextEnabled = !currentState.aiEnabled;
+        return {
+          aiEnabled: nextEnabled,
+          aiStatus: nextEnabled ? "waiting-preview" : "disabled",
+          aiError: nextEnabled ? null : currentState.aiError,
+          aiPreEditActive: nextEnabled,
+          aiRefinementOpen: false,
+        };
+      },
+      () => {
+        if (this.state.aiEnabled) {
+          this.onNewImageForAI();
+        }
+      }
+    );
+  };
+
+  onAIPreEditAcceptAll = () => {
+    this.setState({ aiPreEditActive: false });
+  };
+
+  onAIPreEditRejectAll = () => {
+    this.restoreFromSnapshot(this.state.aiBaselineSettings || this.state.aiInitialSettings);
+    this.setState({ aiPreEditActive: false });
+  };
+
+  onAIPreEditContinue = () => {
+    this.setState({ aiPreEditActive: false });
+  };
+
+  handleAIPreEditChange = (patch) => {
+    const statePatch = {};
+    if (patch.dithering !== undefined) statePatch.optionValue_dithering = patch.dithering;
+    if (patch.scaleFactor !== undefined) statePatch.optionValue_scaleFactor = patch.scaleFactor;
+    if (patch.preprocessingEnabled !== undefined) statePatch.optionValue_preprocessingEnabled = patch.preprocessingEnabled;
+    if (patch.blurPx !== undefined) statePatch.preProcessingValue_blur = patch.blurPx;
+    if (patch.sharpen !== undefined) statePatch.preProcessingValue_sharpen = patch.sharpen;
+    if (patch.brightness !== undefined) statePatch.preProcessingValue_brightness = patch.brightness;
+    if (patch.contrast !== undefined) statePatch.preProcessingValue_contrast = patch.contrast;
+    if (patch.saturation !== undefined) statePatch.preProcessingValue_saturation = patch.saturation;
+    if (patch.transparencyEnabled !== undefined) statePatch.optionValue_transparency = patch.transparencyEnabled;
+    if (patch.transparencyTolerance !== undefined) statePatch.optionValue_transparencyTolerance = patch.transparencyTolerance;
+    if (patch.whereSupportBlocks !== undefined) statePatch.optionValue_whereSupportBlocks = patch.whereSupportBlocks;
+    if (patch.supportBlock !== undefined) statePatch.optionValue_supportBlock = patch.supportBlock;
+
+    this.setState(statePatch);
+  };
+
+  handleSchematicGenerationComplete = async () => {
+    const {
+      aiEnabled,
+      aiOriginalImageDataUrl,
+      aiPreviewDataUrl_current,
+      aiOriginalAnalysis,
+      optionValue_modeNBTOrMapdat,
+      aiRefinementRound,
+      aiMaxRefinementRounds,
+      aiAnalysisRunId,
+    } = this.state;
+
+    if (!aiEnabled) return;
+    if (!aiOriginalImageDataUrl || !aiPreviewDataUrl_current) return;
+    if (aiRefinementRound >= aiMaxRefinementRounds) return;
+
+    const runId = aiAnalysisRunId;
+
+    this.setState({
+      aiRefinementOpen: true,
+      aiRefinementLoading: true,
+      aiRefinementError: null,
+      aiRefinementFeedback: null,
+      aiRefinementSuggestions: null,
+    });
+
+    try {
+      const originalAnalysis =
+        aiOriginalAnalysis || (await analyzeOriginalImage({ imageDataUrl: aiOriginalImageDataUrl }));
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      const feedback = await analyzeSchematicPreview({
+        originalImageDataUrl: aiOriginalImageDataUrl,
+        previewImageDataUrl: aiPreviewDataUrl_current,
+      });
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      const mode = optionValue_modeNBTOrMapdat === MapModes.SCHEMATIC_NBT.uniqueId ? "nbt" : "mapdat";
+      const suggestions = await suggestParameters({
+        originalAnalysis,
+        previewAnalysis: feedback,
+        currentParams: this.getAIParamsSnapshot(),
+        mode,
+        iteration: aiRefinementRound + 1,
+      });
+      if (this.state.aiAnalysisRunId !== runId) return;
+
+      this.setState({
+        aiRefinementLoading: false,
+        aiRefinementFeedback: feedback,
+        aiRefinementSuggestions: suggestions,
+      });
+    } catch (e) {
+      if (this.state.aiAnalysisRunId !== runId) return;
+      this.setState({
+        aiRefinementLoading: false,
+        aiRefinementError: e?.message || String(e),
+      });
+    }
+  };
+
+  onAIRefine = () => {
+    const { aiRefinementSuggestions, aiRefinementRound, aiMaxRefinementRounds, aiPreviewDataUrl_current } = this.state;
+    if (!aiRefinementSuggestions) return;
+    if (aiRefinementRound >= aiMaxRefinementRounds) return;
+
+    const baseline = this.getAIParamsSnapshot();
+
+    this.setState(
+      {
+        aiRefinementOpen: false,
+        aiRefinementError: null,
+        aiRefinementFeedback: null,
+        aiRefinementSuggestions: null,
+        aiPreEditActive: true,
+        aiSuggestions: aiRefinementSuggestions,
+        aiBaselineSettings: baseline,
+        aiPreviewDataUrl_before: aiPreviewDataUrl_current,
+        aiPreviewDataUrl_after: null,
+        aiRefinementRound: aiRefinementRound + 1,
+      },
+      () => {
+        this.applyAISuggestionsToSettings(aiRefinementSuggestions);
+      }
+    );
+  };
+
+  onAIAcceptFinal = () => {
+    this.setState({ aiRefinementOpen: false });
+  };
+
+  onAIReset = () => {
+    const { aiInitialSettings } = this.state;
+    this.restoreFromSnapshot(aiInitialSettings);
+    this.setState((currentState) => ({
+      aiRefinementOpen: false,
+      aiRefinementError: null,
+      aiRefinementFeedback: null,
+      aiRefinementSuggestions: null,
+      aiRefinementRound: 0,
+      aiSuggestions: null,
+      aiOriginalAnalysis: null,
+      aiPreviewAnalysis: null,
+      aiPreviewDataUrl_before: null,
+      aiPreviewDataUrl_after: null,
+      aiPreEditActive: true,
+      aiStatus: currentState.aiEnabled ? "waiting-preview" : "disabled",
+      aiAnalysisRunId: currentState.aiAnalysisRunId + 1,
+    }));
+  };
+
+  onAICloseRefinementPanel = () => {
+    this.setState({ aiRefinementOpen: false });
+  };
+
   onFileDialogEvent = (e) => {
     const files = e.target.files;
     if (!files.length) {
@@ -171,6 +638,7 @@ class MapartController extends Component {
 
   loadUploadedImageFromURL(imageURL, baseFilename) {
     const img = new Image();
+    img.crossOrigin = "anonymous";
     img.onload = () => {
       this.setState({
         uploadedImage: img,
@@ -748,6 +1216,7 @@ class MapartController extends Component {
       optionValue_cropImage_zoom,
       optionValue_cropImage_percent_x,
       optionValue_cropImage_percent_y,
+      optionValue_scaleFactor,
       optionValue_showGridOverlay,
       optionValue_staircasing,
       optionValue_whereSupportBlocks,
@@ -764,6 +1233,8 @@ class MapartController extends Component {
       preProcessingValue_saturation,
       preProcessingValue_backgroundColourSelect,
       preProcessingValue_backgroundColour,
+      preProcessingValue_blur,
+      preProcessingValue_sharpen,
       optionValue_extras_moreStaircasingOptions,
       uploadedImage,
       uploadedImage_baseFilename,
@@ -773,7 +1244,40 @@ class MapartController extends Component {
       mapPreviewWorker_inProgress,
       viewOnline_NBT,
       viewOnline_3D,
+      aiEnabled,
+      aiStatus,
+      aiError,
+      aiOriginalAnalysis,
+      aiPreviewAnalysis,
+      aiSuggestions,
+      aiPreEditActive,
+      aiPreviewDataUrl_before,
+      aiPreviewDataUrl_after,
+      aiRefinementOpen,
+      aiRefinementLoading,
+      aiRefinementError,
+      aiRefinementFeedback,
+      aiRefinementSuggestions,
+      aiRefinementRound,
+      aiMaxRefinementRounds,
     } = this.state;
+
+    const ditherOptions = [
+      { label: "None", value: DitherMethods.None.uniqueId },
+      { label: "Floyd-Steinberg", value: DitherMethods.FloydSteinberg.uniqueId },
+      { label: "Bayer (4x4)", value: DitherMethods.Bayer44.uniqueId },
+      { label: "Ordered (3x3)", value: DitherMethods.Ordered33.uniqueId },
+    ];
+
+    const whereSupportBlocksOptions = Object.values(WhereSupportBlocksModes).map((m) => ({
+      value: m.uniqueId,
+      label: getLocaleString(m.localeKey),
+    }));
+
+    const aiPreEditVisible = aiEnabled && aiPreEditActive;
+    const aiLoading = aiEnabled && ["waiting-preview", "analyzing"].includes(aiStatus);
+    const generationDisabled = aiPreEditVisible;
+
     return (
       <div className="mapartController">
         <BlockSelection
@@ -808,6 +1312,7 @@ class MapartController extends Component {
             optionValue_cropImage_zoom={optionValue_cropImage_zoom}
             optionValue_cropImage_percent_x={optionValue_cropImage_percent_x}
             optionValue_cropImage_percent_y={optionValue_cropImage_percent_y}
+            optionValue_scaleFactor={optionValue_scaleFactor}
             optionValue_showGridOverlay={optionValue_showGridOverlay}
             optionValue_staircasing={optionValue_staircasing}
             optionValue_whereSupportBlocks={optionValue_whereSupportBlocks}
@@ -821,12 +1326,71 @@ class MapartController extends Component {
             preProcessingValue_saturation={preProcessingValue_saturation}
             preProcessingValue_backgroundColourSelect={preProcessingValue_backgroundColourSelect}
             preProcessingValue_backgroundColour={preProcessingValue_backgroundColour}
+            preProcessingValue_blur={preProcessingValue_blur}
+            preProcessingValue_sharpen={preProcessingValue_sharpen}
             uploadedImage={uploadedImage}
             onFileDialogEvent={this.onFileDialogEvent}
             onGetMapMaterials={this.handleSetMapMaterials}
             onMapPreviewWorker_begin={this.onMapPreviewWorker_begin}
+            onPreviewDataUrl={this.handlePreviewDataUrl}
           />
           <div style={{ display: "block" }}>
+            <div className="section" style={{ maxWidth: 520 }}>
+              <label>
+                <input type="checkbox" checked={aiEnabled} onChange={this.onToggleAIEnabled} /> Use AI Suggestions
+              </label>
+              {!aiEnabled && aiError ? (
+                <div style={{ marginTop: "0.25em" }}>
+                  <small style={{ color: "#a00" }}>{aiError}</small>
+                </div>
+              ) : null}
+            </div>
+
+            <PreEditPanel
+              visible={aiPreEditVisible}
+              loading={aiLoading}
+              error={aiStatus === "error" ? aiError : null}
+              originalAnalysis={aiOriginalAnalysis}
+              previewAnalysis={aiPreviewAnalysis}
+              suggestions={aiSuggestions}
+              beforePreviewDataUrl={aiPreviewDataUrl_before}
+              afterPreviewDataUrl={aiPreviewDataUrl_after}
+              ditherOptions={ditherOptions}
+              whereSupportBlocksOptions={whereSupportBlocksOptions}
+              values={{
+                dithering: optionValue_dithering,
+                scaleFactor: optionValue_scaleFactor,
+                preprocessingEnabled: optionValue_preprocessingEnabled,
+                blurPx: preProcessingValue_blur,
+                sharpen: preProcessingValue_sharpen,
+                brightness: preProcessingValue_brightness,
+                contrast: preProcessingValue_contrast,
+                saturation: preProcessingValue_saturation,
+                transparencyEnabled: optionValue_transparency,
+                transparencyTolerance: optionValue_transparencyTolerance,
+                whereSupportBlocks: optionValue_whereSupportBlocks,
+                supportBlock: optionValue_supportBlock,
+              }}
+              onChange={this.handleAIPreEditChange}
+              onAcceptAll={this.onAIPreEditAcceptAll}
+              onRejectAll={this.onAIPreEditRejectAll}
+              onContinue={this.onAIPreEditContinue}
+            />
+
+            <RefinementPanel
+              visible={aiEnabled && aiRefinementOpen}
+              loading={aiRefinementLoading}
+              error={aiRefinementError}
+              feedback={aiRefinementFeedback}
+              suggestions={aiRefinementSuggestions}
+              round={Math.min(aiRefinementRound + 1, aiMaxRefinementRounds)}
+              maxRounds={aiMaxRefinementRounds}
+              onRefine={this.onAIRefine}
+              onAccept={this.onAIAcceptFinal}
+              onReset={this.onAIReset}
+              onClose={this.onAICloseRefinementPanel}
+            />
+
             <MapSettings
               getLocaleString={getLocaleString}
               coloursJSON={coloursJSON}
@@ -881,40 +1445,46 @@ class MapartController extends Component {
               optionValue_extras_moreStaircasingOptions={optionValue_extras_moreStaircasingOptions}
               onOptionChange_extras_moreStaircasingOptions={this.onOptionChange_extras_moreStaircasingOptions}
             />
-            <GreenButtons
-              getLocaleString={getLocaleString}
-              coloursJSON={coloursJSON}
-              selectedBlocks={selectedBlocks}
-              optionValue_version={optionValue_version}
-              optionValue_modeNBTOrMapdat={optionValue_modeNBTOrMapdat}
-              optionValue_mapSize_x={optionValue_mapSize_x}
-              optionValue_mapSize_y={optionValue_mapSize_y}
-              optionValue_cropImage={optionValue_cropImage}
-              optionValue_cropImage_zoom={optionValue_cropImage_zoom}
-              optionValue_cropImage_percent_x={optionValue_cropImage_percent_x}
-              optionValue_cropImage_percent_y={optionValue_cropImage_percent_y}
-              optionValue_staircasing={optionValue_staircasing}
-              optionValue_whereSupportBlocks={optionValue_whereSupportBlocks}
-              optionValue_supportBlock={optionValue_supportBlock}
-              optionValue_transparency={optionValue_transparency}
-              optionValue_transparencyTolerance={optionValue_transparencyTolerance}
-              optionValue_mapdatFilenameUseId={optionValue_mapdatFilenameUseId}
-              optionValue_mapdatFilenameIdStart={optionValue_mapdatFilenameIdStart}
-              optionValue_betterColour={optionValue_betterColour}
-              optionValue_dithering={optionValue_dithering}
-              optionValue_preprocessingEnabled={optionValue_preprocessingEnabled}
-              preProcessingValue_brightness={preProcessingValue_brightness}
-              preProcessingValue_contrast={preProcessingValue_contrast}
-              preProcessingValue_saturation={preProcessingValue_saturation}
-              preProcessingValue_backgroundColourSelect={preProcessingValue_backgroundColourSelect}
-              preProcessingValue_backgroundColour={preProcessingValue_backgroundColour}
-              uploadedImage={uploadedImage}
-              uploadedImage_baseFilename={uploadedImage_baseFilename}
-              currentMaterialsData={currentMaterialsData}
-              mapPreviewWorker_inProgress={mapPreviewWorker_inProgress}
-              downloadBlobFile={this.downloadBlobFile}
-              onGetViewOnlineNBT={this.onGetViewOnlineNBT}
-            />
+            <div style={generationDisabled ? { opacity: 0.5, pointerEvents: "none" } : null}>
+              <GreenButtons
+                getLocaleString={getLocaleString}
+                coloursJSON={coloursJSON}
+                selectedBlocks={selectedBlocks}
+                optionValue_version={optionValue_version}
+                optionValue_modeNBTOrMapdat={optionValue_modeNBTOrMapdat}
+                optionValue_mapSize_x={optionValue_mapSize_x}
+                optionValue_mapSize_y={optionValue_mapSize_y}
+                optionValue_cropImage={optionValue_cropImage}
+                optionValue_cropImage_zoom={optionValue_cropImage_zoom}
+                optionValue_cropImage_percent_x={optionValue_cropImage_percent_x}
+                optionValue_cropImage_percent_y={optionValue_cropImage_percent_y}
+                optionValue_scaleFactor={optionValue_scaleFactor}
+                optionValue_staircasing={optionValue_staircasing}
+                optionValue_whereSupportBlocks={optionValue_whereSupportBlocks}
+                optionValue_supportBlock={optionValue_supportBlock}
+                optionValue_transparency={optionValue_transparency}
+                optionValue_transparencyTolerance={optionValue_transparencyTolerance}
+                optionValue_mapdatFilenameUseId={optionValue_mapdatFilenameUseId}
+                optionValue_mapdatFilenameIdStart={optionValue_mapdatFilenameIdStart}
+                optionValue_betterColour={optionValue_betterColour}
+                optionValue_dithering={optionValue_dithering}
+                optionValue_preprocessingEnabled={optionValue_preprocessingEnabled}
+                preProcessingValue_brightness={preProcessingValue_brightness}
+                preProcessingValue_contrast={preProcessingValue_contrast}
+                preProcessingValue_saturation={preProcessingValue_saturation}
+                preProcessingValue_backgroundColourSelect={preProcessingValue_backgroundColourSelect}
+                preProcessingValue_backgroundColour={preProcessingValue_backgroundColour}
+                preProcessingValue_blur={preProcessingValue_blur}
+                preProcessingValue_sharpen={preProcessingValue_sharpen}
+                uploadedImage={uploadedImage}
+                uploadedImage_baseFilename={uploadedImage_baseFilename}
+                currentMaterialsData={currentMaterialsData}
+                mapPreviewWorker_inProgress={mapPreviewWorker_inProgress}
+                downloadBlobFile={this.downloadBlobFile}
+                onGetViewOnlineNBT={this.onGetViewOnlineNBT}
+                onSchematicGenerationComplete={this.handleSchematicGenerationComplete}
+              />
+            </div>
           </div>
           {optionValue_modeNBTOrMapdat === MapModes.SCHEMATIC_NBT.uniqueId ? (
             <Materials

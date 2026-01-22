@@ -49,6 +49,7 @@ class GreenButtons extends Component {
       mapPreviewWorker_inProgress,
       downloadBlobFile,
       onGetViewOnlineNBT,
+      onSchematicGenerationComplete,
     } = this.props;
     if (mapPreviewWorker_inProgress) {
       this.setState({ mapPreviewWorker_onFinishCallback: () => this.getNBT_base(workerHeader) });
@@ -61,6 +62,7 @@ class GreenButtons extends Component {
     this.nbtWorker.terminate();
     this.resetButtonWidths();
     let numberOfSplitsCalculated = 0;
+    const totalSplits = optionValue_mapSize_x * optionValue_mapSize_y;
     let zipFile = new JSZip();
     const t0 = performance.now();
     this.nbtWorker = new Worker(NBTWorker);
@@ -87,6 +89,9 @@ class GreenButtons extends Component {
           console.log(`Created NBT for 'view online' by ${(t1 - t0).toString()}ms`);
           const { NBT_Array } = e.data.body;
           onGetViewOnlineNBT(NBT_Array);
+          if (onSchematicGenerationComplete) {
+            onSchematicGenerationComplete({ kind: "view-online", workerHeader });
+          }
           break;
         }
         case "NBT_ARRAY": {
@@ -97,14 +102,20 @@ class GreenButtons extends Component {
           const NBT_Array_gzipped = gzip(NBT_Array);
           if (workerHeader === "CREATE_NBT_SPLIT") {
             zipFile.file(`${uploadedImage_baseFilename}_${whichMap_x}_${whichMap_y}.nbt`, NBT_Array_gzipped);
-            if (numberOfSplitsCalculated === optionValue_mapSize_x * optionValue_mapSize_y) {
+            if (numberOfSplitsCalculated === totalSplits) {
               zipFile.generateAsync({ type: "blob" }).then((content) => {
                 downloadBlobFile(content, `${uploadedImage_baseFilename}.zip`);
+                if (onSchematicGenerationComplete) {
+                  onSchematicGenerationComplete({ kind: "download", workerHeader });
+                }
               });
             }
           } else {
             const downloadBlob = new Blob([NBT_Array_gzipped], { type: "application/x-minecraft-level" });
             downloadBlobFile(downloadBlob, `${uploadedImage_baseFilename}.nbt`);
+            if (onSchematicGenerationComplete) {
+              onSchematicGenerationComplete({ kind: "download", workerHeader });
+            }
           }
           break;
         }
@@ -115,9 +126,15 @@ class GreenButtons extends Component {
           const { Mapdat_Bytes, whichMap_x, whichMap_y } = e.data.body;
           const Mapdat_Bytes_gzipped = gzip(Mapdat_Bytes);
           const downloadBlob = new Blob([Mapdat_Bytes_gzipped], { type: "application/x-minecraft-level" });
-          downloadBlobFile(downloadBlob, optionValue_mapdatFilenameUseId
-            ? `map_${(optionValue_mapdatFilenameIdStart + whichMap_y * optionValue_mapSize_x + whichMap_x).toString()}.dat`
-            : `${uploadedImage_baseFilename}_${whichMap_x.toString()}_${whichMap_y.toString()}.dat`);
+          downloadBlobFile(
+            downloadBlob,
+            optionValue_mapdatFilenameUseId
+              ? `map_${(optionValue_mapdatFilenameIdStart + whichMap_y * optionValue_mapSize_x + whichMap_x).toString()}.dat`
+              : `${uploadedImage_baseFilename}_${whichMap_x.toString()}_${whichMap_y.toString()}.dat`
+          );
+          if (numberOfSplitsCalculated === totalSplits && onSchematicGenerationComplete) {
+            onSchematicGenerationComplete({ kind: "download", workerHeader });
+          }
           break;
         }
         case "MAPDAT_BYTES_ZIP": {
@@ -132,9 +149,12 @@ class GreenButtons extends Component {
               : `${uploadedImage_baseFilename}_${whichMap_x.toString()}_${whichMap_y.toString()}.dat`,
             Mapdat_Bytes_gzipped
           );
-          if (numberOfSplitsCalculated === optionValue_mapSize_x * optionValue_mapSize_y) {
+          if (numberOfSplitsCalculated === totalSplits) {
             zipFile.generateAsync({ type: "blob" }).then((content) => {
               downloadBlobFile(content, `${uploadedImage_baseFilename}.zip`);
+              if (onSchematicGenerationComplete) {
+                onSchematicGenerationComplete({ kind: "download", workerHeader });
+              }
             });
           }
           break;
@@ -192,6 +212,7 @@ class GreenButtons extends Component {
       optionValue_cropImage_zoom,
       optionValue_cropImage_percent_x,
       optionValue_cropImage_percent_y,
+      optionValue_scaleFactor,
       optionValue_staircasing,
       optionValue_whereSupportBlocks,
       optionValue_supportBlock,
@@ -207,6 +228,8 @@ class GreenButtons extends Component {
       preProcessingValue_saturation,
       preProcessingValue_backgroundColourSelect,
       preProcessingValue_backgroundColour,
+      preProcessingValue_blur,
+      preProcessingValue_sharpen,
       uploadedImage,
     } = this.props;
     return [
@@ -219,6 +242,7 @@ class GreenButtons extends Component {
       prevProps.optionValue_cropImage_zoom !== optionValue_cropImage_zoom,
       prevProps.optionValue_cropImage_percent_x !== optionValue_cropImage_percent_x,
       prevProps.optionValue_cropImage_percent_y !== optionValue_cropImage_percent_y,
+      prevProps.optionValue_scaleFactor !== optionValue_scaleFactor,
       prevProps.optionValue_staircasing !== optionValue_staircasing,
       prevProps.optionValue_whereSupportBlocks !== optionValue_whereSupportBlocks,
       prevProps.optionValue_supportBlock !== optionValue_supportBlock,
@@ -234,6 +258,8 @@ class GreenButtons extends Component {
       prevProps.preProcessingValue_saturation !== preProcessingValue_saturation,
       prevProps.preProcessingValue_backgroundColourSelect !== preProcessingValue_backgroundColourSelect,
       prevProps.preProcessingValue_backgroundColour !== preProcessingValue_backgroundColour,
+      prevProps.preProcessingValue_blur !== preProcessingValue_blur,
+      prevProps.preProcessingValue_sharpen !== preProcessingValue_sharpen,
       prevProps.uploadedImage !== uploadedImage,
     ].some((elt) => elt);
   }
